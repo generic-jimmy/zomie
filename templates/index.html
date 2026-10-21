@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SessionScope Lab — PHP Session Misconfig Checker</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>SessionScope <span class="tag">LAB</span></h1>
+      <p class="sub">PHP session misconfiguration scope checker — detection only, inert payloads.</p>
+    </header>
+
+    {% if error %}
+      <section class="card error-card">
+        <h2>Scan refused</h2>
+        <p>{{ error }}</p>
+        {% if scope %}<pre class="scope">{{ scope }}</pre>{% endif %}
+      </section>
+    {% endif %}
+
+    <section class="card">
+      <form method="POST" action="/scan">
+        <label for="target">Target URL (your lab site)</label>
+        <input type="text" id="target" name="target" required
+               placeholder="http://host.docker.internal:18080" value="{{ report.target if report else '' }}">
+
+        <div class="grid">
+          <div>
+            <label for="path">Scan path</label>
+            <input type="text" id="path" name="path" placeholder="/index.php" value="/index.php">
+          </div>
+          <div class="checkbox-cell">
+            <label class="chk">
+              <input type="checkbox" name="phpinfo" checked>
+              Probe common phpinfo paths
+            </label>
+          </div>
+        </div>
+
+        <details>
+          <summary>Optional: handler-mismatch endpoints</summary>
+          <div class="grid">
+            <div>
+              <label for="write_path">Write endpoint (php_serialize dir)</label>
+              <input type="text" id="write_path" name="write_path" placeholder="/app/upload.php">
+            </div>
+            <div>
+              <label for="read_path">Read endpoint (php handler dir)</label>
+              <input type="text" id="read_path" name="read_path" placeholder="/api/endpoint.php">
+            </div>
+          </div>
+        </details>
+
+        <label class="chk auth">
+          <input type="checkbox" name="authorized" required>
+          I confirm this target is my own lab system or I have written authorization to test it.
+        </label>
+
+        <button type="submit">Run scope check</button>
+      </form>
+    </section>
+
+    {% if report %}
+    <section class="card report">
+      <div class="report-head">
+        <h2>Report <span class="scan-id">#{{ report.scan_id }}</span></h2>
+        <p class="meta">{{ report.target }} — {{ report.finished_at }}</p>
+        <p class="overall {{ report.overall }}">{{ report.overall_label }}</p>
+      </div>
+
+      {% for r in report.results %}
+      <article class="check {{ r.status }}">
+        <h3>{{ r.title }}
+          <span class="badge {{ r.status }}">{{ r.status }}</span>
+        </h3>
+        <p>{{ r.summary }}</p>
+        {% if r.evidence %}
+        <ul class="evidence">
+          {% for e in r.evidence %}<li><code>{{ e }}</code></li>{% endfor %}
+        </ul>
+        {% endif %}
+        {% if r.remediation %}
+        <div class="fix">
+          <strong>Fix / verify:</strong>
+          <ul>
+            {% for f in r.remediation %}<li>{{ f }}</li>{% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+      </article>
+      {% endfor %}
+
+      <h3 class="log-title">Request log ({{ report.request_log|length }} requests)</h3>
+      <table class="log">
+        <tr><th>Method</th><th>URL</th><th>Status</th><th>ms</th><th>Note</th></tr>
+        {% for l in report.request_log %}
+        <tr>
+          <td>{{ l.method }}</td><td class="url">{{ l.url }}</td>
+          <td>{{ l.status if l.status is not none else 'ERR' }}</td>
+          <td>{{ l.ms }}</td><td>{{ l.note }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </section>
+    {% endif %}
+
+    <footer>
+      <p>SessionScope Lab is a detection-only utility. It sends inert markers and an
+         empty <code>stdClass</code> (no destructor) — it never attempts code execution
+         and produces no shells. Test only systems you own or are authorized to assess.</p>
+    </footer>
+  </main>
+</body>
+</html>
