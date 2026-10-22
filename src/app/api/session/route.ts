@@ -37,7 +37,7 @@ export async function POST(req: Request) {
     profile: body.profile === "lab" ? "lab" : "bookworm",
     hugeMb: Number(body.hugeMb) > 0 ? Number(body.hugeMb) : 12,
     timeout: Number(body.timeout) > 0 ? Number(body.timeout) : 30,
-    retries: Number(body.retries) > 0 ? Math.min(50, Number(body.retries)) : 10,
+    retries: Number(body.retries) > 0 ? Math.min(100, Number(body.retries)) : 25,
     zifOffset: parseHex(body.zifOffset),
     dtorOffset: parseHex(body.dtorOffset),
     htdataOffset: parseHex(body.htdataOffset),

@@ -127,18 +127,26 @@ Stage 1/2 leaks are **probabilistic heap grooming**, not deterministic: each
 attempt rotates a fresh prefork worker, sends the OOM + grooming requests, and
 scores the `Set-Cookie` bytes (stage 1 needs **≥ 8** 2MB-aligned pointers in a
 cookie of ≥ 1000 bytes). The author's CLI default is `--retries 3`; this console
-defaults to **10 attempts per stage** (tunable in `advanced`, cap 50) and
+defaults to **25 attempts per stage** (tunable in `advanced`, cap 100) and
 rotates the worker between attempts.
 
+The agent is also **adaptive**: after 3 consecutive stage-1 misses it switches
+to the other build profile (the two calibrated builds use different grooming
+field counts), and it cycles `huge_mb` (12 → 7 → 24 MB) when the diagnostics
+point at `post_max_size`/`memory_limit` as the blocker. Every failed attempt
+now logs a one-line reason so you can see *why* it missed.
+
 Retries only help when the target actually meets the exploit requirements —
-if attempts keep failing, read the diagnostic the agent logs after the last
+if attempts keep failing, read the diagnostic the agent logs after each
 attempt:
 
 | diagnostic | meaning | fix |
 |------------|---------|-----|
+| `no Set-Cookie leak at all` (per attempt) | target ignored the session upload entirely | wrong URL page, `session.upload_progress.enabled=0`, or `post_max_size` smaller than `huge_mb` (the grooming POST gets dropped) |
 | `no PHPSESSID Set-Cookie leak observed` | page/session config wrong or PHP ≠ 8.4.26 mod_php prefork | enable `session.upload_progress.enabled=1`, `session.use_strict_mode=0`, `session.use_cookies=1`; confirm PHP 8.4.26 + Apache prefork |
-| `leak cookie only N bytes` | grooming did not reach the leak window | just retry / more retries |
-| `leak cookie present ... but no usable pointer pattern` | OOM did not trigger or input caps interfere | raise `huge_mb` above the target `memory_limit` (e.g. 32); target needs `max_input_vars=1000` |
+| `leak cookie only NB (<1000)` | grooming did not reach the leak window | just retry / more retries; agent auto-cycles `huge_mb` |
+| `leak cookie ... best 2MB group N (need >=8)` | pattern too weak: OOM did not trigger or input caps interfere | raise `huge_mb` above the target `memory_limit` (agent cycles 12→24 automatically); target needs `max_input_vars=1000` |
+| `[manager] agent daemon exited ...` | the python engine process died and was restarted (run lost) | check `engine/agent.log` for the traceback; the console now never kills a live engine — restarts only happen when it actually exited |
 
 Target requirements (from the PoC README): `display_errors=1`, `memory_limit`
 below `--huge-mb` (default 12M), `max_input_vars=1000`, `session.use_cookies=1`,

@@ -103,7 +103,7 @@ export default function Console() {
     htdataOffset: "",
     callbackIp: "",
     callbackPort: 4444,
-    retries: 10,
+    retries: 25,
     hugeMb: 12,
     mock: false,
   });
@@ -420,10 +420,10 @@ export default function Console() {
                 <Input
                   type="number"
                   min={1}
-                  max={50}
+                  max={100}
                   value={cfg.retries}
                   onChange={(e) =>
-                    setCfg({ ...cfg, retries: Math.min(50, Math.max(1, Number(e.target.value) || 10)) })
+                    setCfg({ ...cfg, retries: Math.min(100, Math.max(1, Number(e.target.value) || 25)) })
                   }
                   className="bg-zinc-950 border-zinc-800 font-mono text-[11px] h-8"
                 />

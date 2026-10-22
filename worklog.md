@@ -67,3 +67,115 @@ Stage Summary:
 - Real-target behavior (resp/fetch/tail/tmpdrop channel availability) depends
   on the lab build and is auto-probed at runtime; mock mode covers UI/API/SSE
   verification which passed fully in-browser.
+
+---
+Task ID: 2
+Agent: main (Z.ai)
+Task: Fix "[-] unknown error" on Render deployment + declutter UI per user feedback.
+
+Work Log:
+- Root-caused the masked failures: engine/agent.py dispatch() emitted failures
+  with the real reason only inside data["error"] (top-level error field absent),
+  while the UI read msg.error -> always showed "unknown error".
+- engine/agent.py: dispatch() now promotes data["error"] to the top-level
+  result.error; op_pwn() gained a preflight stage (TCP connect + HTTP GET with
+  Server banner log) that fails fast with actionable text, including a
+  private/VPN-IP hint pointing to docker compose / public target URL.
+- Rewrote src/components/p2s/console.tsx as a minimal console: slim header,
+  single target bar (URL + profile + PWN, auto-connects), stage chips + log,
+  terminal (auto-opens shell channel on ready), advanced drawer (offsets,
+  callback ip/port, mock). Removed: raw PoC card, quick commands, mode
+  selector, leaks readout, tooltips, extra header badges.
+- Verified in browser: mock PWN -> stages done -> shell auto-open -> cat /flag*
+  -> THM{php2shell_mock_flag_2026}; real-mode unreachable target now logs
+  "[-] cannot reach 127.0.0.1:9 ([Errno 111] Connection refused) - private/VPN
+  addresses are only routable..." in log + terminal + toast. Lint clean.
+- README: added "Deploying on Render (or any PaaS)" section (PORT auto-bind,
+  reachability rules for THM VPN IPs vs Render private services, local compose
+  alternative). Refreshed download/php2shell-c2-console.tar.gz.
+
+Stage Summary:
+- Failures now always carry their real reason end-to-end (agent -> SSE -> UI).
+- Preflight stage catches unreachable targets in seconds with a fix hint.
+- UI reduced to target bar + log + terminal; shell channel auto-opens.
+- NOTE for user: on Render, 10.0.0.12:8080 is only exploitable if it is a
+  Render private service in the same account/region; otherwise run the console
+  locally (docker compose) where the target is routable.
+
+---
+Task ID: 3
+Agent: main (Z.ai)
+Task: User reported HEAP_LEAK_FAILED after only 3 attempts; asked for research
+on retry behavior of this vuln class + more tries.
+
+Work Log:
+- Research: PoC README confirms --retries = attempts per leak stage (author
+  default 3, stage3 = retries+2); leak scoring needs >=8 2MB-aligned pointers
+  in a >=1000-byte Set-Cookie; target must meet memory_limit < huge_mb,
+  upload_progress.enabled=1, use_strict_mode=0, max_input_vars=1000, mod_php
+  prefork. Retries only help when requirements hold -> diagnostics matter.
+- engine/agent.py: default retries 3 -> 10 (cfg), richer failure results
+  ("HEAP_LEAK_FAILED after N attempts (last leak cookie: M bytes)"); added
+  parse_cookie diagnostic hook + _leak_diag() distinguishing: no Set-Cookie at
+  all (config/PHP version) vs short cookie (grooming; retry) vs full cookie
+  with no usable pointers (OOM/huge_mb vs memory_limit, max_input_vars).
+- preflight now probes with the exploit's own HTTP/1.1 Target.get (old raw
+  HTTP/1.0 probe caused the user's "preflight: no response" artifact); logs
+  "GET path -> HTTP status (N bytes)"; TCP-open-but-no-HTTP fails with
+  http/https + port hint.
+- UI: advanced drawer gained "retries / stage" (default 10, cap 50) and
+  "huge_mb (> memory_limit)" inputs; session route default retries 10, cap 50.
+- README: new "Reliability & retries" section with diagnostic table + target
+  requirements.
+- Verified via scripts/fake_target.py (plain/cookie/tcp modes): preflight 200
+  log; diag "no PHPSESSID Set-Cookie leak observed"; diag "leak cookie present
+  (1200 bytes) but no usable pointer pattern ... huge_mb"; "TCP open but no
+  HTTP response". Browser mock regression passed (PWN -> auto shell -> flag).
+  Lint clean. Bundle refreshed.
+
+Stage Summary:
+- Retry count is now user-controlled (default 10) with per-stage rotation.
+- Failures explain themselves: preflight, per-stage leak diagnostics, and
+  attempt counts in result errors.
+- Fake-target harness kept in scripts/fake_target.py for future regression.
+
+---
+Task ID: 4
+Agent: main (Z.ai)
+Task: Explain "agent daemon spawned" log line + root-cause mid-run daemon
+restart that killed the user's exploit run (attempts 1-9 then daemon banner),
+plus make stage-1 misses explain themselves.
+
+Work Log:
+- Explained the line: manager (agent-manager.ts) starting the python engine;
+  pid = engine process, port 47017 = loopback-only control channel.
+- Root-caused mid-run restarts: ensureDaemon() SIGKILLed the LIVE engine when a
+  single 400ms port probe timed out under load (12MB uploads); also not
+  single-flight (concurrent first requests could double-spawn), and engine
+  stderr was discarded (stdio: ignore) so crashes were invisible.
+- agent-manager.ts: ensureDaemon now single-flight; if the port probe fails but
+  the recorded pid is alive it WAITS for the port instead of killing; SIGKILL
+  only for a genuinely wedged process. Engine stdout/stderr -> engine/agent.log
+  (crash tracebacks survive). proc exit publishes "[manager] agent daemon
+  exited (pid, code, signal)" into the event stream. snapshot() merges manager
+  lifecycle logs with daemon logs (dedupe ts+msg) so restarts show in replay.
+- engine/agent.py: accept loop never dies on transient OSError. New per-attempt
+  leak diagnostics via chunk_base_from_cookie/libphp_base_from_cookie hooks:
+  one line per miss with cookie size, heap-ptr candidates, best 2MB group
+  (need >=8), stage2 ptr page_ok. Categories drive adaptivity: after 3 misses
+  auto-switch build profile (bookworm<->lab incl. stage1_n/stage2/pads/htdata),
+  huge_mb cycles 12->7->24 on "short"/"pattern" signatures. Default retries
+  10 -> 25 (session route + console cap 100).
+- Tests: scripts/test_daemon_fix.py (fake_target plain mode): 4 attempts, 4
+  per-attempt diag lines, profile auto-switch after 3 misses, daemon alive
+  after failed run -> PASS. Live server: mock PWN ok; kill -9 engine ->
+  "agent daemon exited (signal=SIGKILL)" logged + clean respawn. Lint clean.
+- README "Reliability & retries" rewritten (25 attempts, adaptive behavior,
+  new diagnostic table incl. daemon-exited row).
+
+Stage Summary:
+- Engine restarts mid-run are fixed (no more probe-kill) and, if the engine
+  ever dies, the run now shows WHY (exit code/signal + engine/agent.log).
+- Every stage-1/2 miss now reports a concrete reason per attempt; profile and
+  huge_mb auto-adapt when the signature matches a known blocker.
+- Retries default 25/attempt (cap 100).

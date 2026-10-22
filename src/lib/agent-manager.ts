@@ -77,6 +77,7 @@ interface ModState {
   lastConfig: SessionConfig | null;
   lastResult: Snapshot["lastResult"];
   proc: ReturnType<typeof spawn> | null;
+  starting: Promise<boolean> | null;
 }
 
 // bump when the listener wiring changes so stale sockets get evicted
@@ -92,6 +93,7 @@ const M: ModState = g.__p2sMod ?? {
   lastConfig: null,
   lastResult: null,
   proc: null,
+  starting: null,
 };
 g.__p2sMod = M;
 
@@ -158,49 +160,114 @@ export async function daemonAlive(): Promise<boolean> {
   return s !== null;
 }
 
+function pidAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Engine stdout/stderr go to engine/agent.log so crash tracebacks survive. */
+function engineLogFds(): ("ignore" | number)[] {
+  try {
+    const fd = fs.openSync(path.join(engineDir(), "agent.log"), "a");
+    return ["ignore", fd, fd];
+  } catch {
+    return ["ignore"];
+  }
+}
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Start the engine if (and only if) it is really down.
+ *
+ * - Single-flight: concurrent callers share one spawn attempt (no double bind).
+ * - Never SIGKILLs a live engine just because one 400ms port probe failed:
+ *   if the process exists we wait for the port instead. This used to restart
+ *   the daemon mid-exploit whenever a probe timed out under load.
+ */
 export function ensureDaemon(): Promise<boolean> {
-  return (async () => {
-    if (await daemonAlive()) return true;
-    const dir = engineDir();
-    const script = path.join(dir, "agent.py");
-    if (!fs.existsSync(script)) {
-      throw new Error(`engine script not found: ${script}`);
-    }
-    const python = process.env.PYTHON_BIN || "python3";
-    if (M.proc) {
-      try {
-        M.proc.kill("SIGKILL");
-      } catch {
-        /* already dead */
+  if (!M.starting) {
+    M.starting = (async () => {
+      if (await daemonAlive()) return true;
+      const dir = engineDir();
+      const script = path.join(dir, "agent.py");
+      if (!fs.existsSync(script)) {
+        throw new Error(`engine script not found: ${script}`);
       }
-      M.proc = null;
-    }
-    const proc = spawn(python, ["-u", script, "--serve"], {
-      cwd: dir,
-      stdio: "ignore",
-      detached: false,
-    });
-    M.proc = proc;
-    try {
-      fs.writeFileSync(path.join(dir, "agent.pid"), String(proc.pid ?? ""));
-    } catch {
-      /* best effort */
-    }
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline) {
-      if (await daemonAlive()) {
+      // Port probe failed but the engine process is alive: it may just be
+      // busy/slow. Give it time instead of killing it.
+      if (M.proc && pidAlive(M.proc.pid)) {
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          if (await daemonAlive()) return true;
+          if (!pidAlive(M.proc.pid)) break;
+          await wait(250);
+        }
+        if (await daemonAlive()) return true;
+        // genuinely wedged: only now do we put it down
         publish({
           type: "log",
-          level: "info",
-          msg: `[*] agent daemon spawned (pid ${proc.pid}, port ${AGENT_PORT})`,
+          level: "warn",
+          msg: "[manager] engine process alive but not serving; restarting it",
           ts: Date.now(),
         });
-        return true;
+        try {
+          M.proc.kill("SIGKILL");
+        } catch {
+          /* already dead */
+        }
+        M.proc = null;
       }
-      await new Promise((r) => setTimeout(r, 250));
-    }
-    throw new Error("agent daemon did not come up on port " + AGENT_PORT);
-  })();
+      const python = process.env.PYTHON_BIN || "python3";
+      const proc = spawn(python, ["-u", script, "--serve"], {
+        cwd: dir,
+        stdio: engineLogFds(),
+        detached: false,
+      });
+      M.proc = proc;
+      proc.on("exit", (code, signal) => {
+        if (M.proc === proc) M.proc = null;
+        publish({
+          type: "log",
+          level: "warn",
+          msg: `[manager] agent daemon exited (pid ${proc.pid}, code=${code ?? "?"}, signal=${signal ?? "none"}) - see engine/agent.log`,
+          ts: Date.now(),
+        });
+      });
+      try {
+        fs.writeFileSync(path.join(dir, "agent.pid"), String(proc.pid ?? ""));
+      } catch {
+        /* best effort */
+      }
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        if (await daemonAlive()) {
+          publish({
+            type: "log",
+            level: "info",
+            msg: `[*] agent daemon spawned (pid ${proc.pid}, port ${AGENT_PORT})`,
+            ts: Date.now(),
+          });
+          return true;
+        }
+        if (!pidAlive(proc.pid)) {
+          throw new Error(
+            `agent daemon died on startup (see engine/agent.log); port ${AGENT_PORT}`,
+          );
+        }
+        await wait(250);
+      }
+      throw new Error("agent daemon did not come up on port " + AGENT_PORT);
+    })().finally(() => {
+      M.starting = null;
+    });
+  }
+  return M.starting;
 }
 
 /** One request/response round-trip; broadcasts seen on the wire are published. */
@@ -331,6 +398,20 @@ export async function startListener(): Promise<void> {
 
 /* ---------------- snapshots ---------------- */
 
+/** Merge manager-side lifecycle logs with the daemon's own log, dedup by ts+msg. */
+function mergeLogs(a: LogLine[], b: LogLine[]): LogLine[] {
+  const seen = new Set<string>();
+  const out: LogLine[] = [];
+  for (const l of [...a, ...b]) {
+    const key = `${l.ts}|${l.msg}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(l);
+  }
+  out.sort((x, y) => x.ts - y.ts);
+  return out;
+}
+
 export async function snapshot(): Promise<Snapshot> {
   let snap: Snapshot = {
     config: M.lastConfig,
@@ -360,7 +441,7 @@ export async function snapshot(): Promise<Snapshot> {
         leaks: daemon.leaks ?? {},
         stages: daemon.stages ?? {},
         shellStatus: daemon.shell_status ?? null,
-        logs: daemon.logs?.length ? daemon.logs : M.logs,
+        logs: mergeLogs(M.logs, daemon.logs ?? []),
         url: daemon.url ?? M.lastConfig?.url ?? null,
         mock: Boolean(daemon.mock),
         lastResult: M.lastResult,
