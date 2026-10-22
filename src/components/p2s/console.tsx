@@ -103,6 +103,8 @@ export default function Console() {
     htdataOffset: "",
     callbackIp: "",
     callbackPort: 4444,
+    retries: 10,
+    hugeMb: 12,
     mock: false,
   });
   const [snap, setSnap] = useState<Snapshot>({
@@ -409,6 +411,31 @@ export default function Console() {
                   value={cfg.callbackPort}
                   onChange={(e) =>
                     setCfg({ ...cfg, callbackPort: Number(e.target.value) || 4444 })
+                  }
+                  className="bg-zinc-950 border-zinc-800 font-mono text-[11px] h-8"
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-zinc-600">retries / stage</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={cfg.retries}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, retries: Math.min(50, Math.max(1, Number(e.target.value) || 10)) })
+                  }
+                  className="bg-zinc-950 border-zinc-800 font-mono text-[11px] h-8"
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label className="text-[10px] text-zinc-600">huge_mb (&gt; memory_limit)</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={cfg.hugeMb}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, hugeMb: Math.max(1, Number(e.target.value) || 12) })
                   }
                   className="bg-zinc-950 border-zinc-800 font-mono text-[11px] h-8"
                 />

