@@ -180,6 +180,48 @@ function engineLogFds(): ("ignore" | number)[] {
   }
 }
 
+/**
+ * Last lines of the engine log. Users on PaaS (Render etc.) cannot read
+ * files inside the container, so crash output must be pushed into the
+ * console event stream instead of referenced as "see engine/agent.log".
+ */
+function tailEngineLog(maxLines = 12): string[] {
+  try {
+    const raw = fs.readFileSync(path.join(engineDir(), "agent.log"), "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+    return lines.slice(-maxLines);
+  } catch {
+    return [];
+  }
+}
+
+function publishEngineLogTail(reason: string) {
+  publish({
+    type: "log",
+    level: "warn",
+    msg: `${reason} - engine output follows:`,
+    ts: Date.now(),
+  });
+  const lines = tailEngineLog();
+  if (!lines.length) {
+    publish({
+      type: "log",
+      level: "warn",
+      msg: "[engine] (agent.log empty or unreadable)",
+      ts: Date.now(),
+    });
+    return;
+  }
+  for (const l of lines) {
+    publish({
+      type: "log",
+      level: "warn",
+      msg: `[engine] ${l.slice(0, 400)}`,
+      ts: Date.now(),
+    });
+  }
+}
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -232,12 +274,9 @@ export function ensureDaemon(): Promise<boolean> {
       M.proc = proc;
       proc.on("exit", (code, signal) => {
         if (M.proc === proc) M.proc = null;
-        publish({
-          type: "log",
-          level: "warn",
-          msg: `[manager] agent daemon exited (pid ${proc.pid}, code=${code ?? "?"}, signal=${signal ?? "none"}) - see engine/agent.log`,
-          ts: Date.now(),
-        });
+        publishEngineLogTail(
+          `[manager] agent daemon exited (pid ${proc.pid}, code=${code ?? "?"}, signal=${signal ?? "none"})`,
+        );
       });
       try {
         fs.writeFileSync(path.join(dir, "agent.pid"), String(proc.pid ?? ""));
@@ -256,8 +295,9 @@ export function ensureDaemon(): Promise<boolean> {
           return true;
         }
         if (!pidAlive(proc.pid)) {
+          const tail = tailEngineLog(6).map((l) => l.slice(0, 200)).join(" | ");
           throw new Error(
-            `agent daemon died on startup (see engine/agent.log); port ${AGENT_PORT}`,
+            `agent daemon died on startup${tail ? `: ${tail}` : `; port ${AGENT_PORT}`}`,
           );
         }
         await wait(250);

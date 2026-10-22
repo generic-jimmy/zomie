@@ -43,7 +43,12 @@ interface Snapshot {
 
 /* ---------------- helpers ---------------- */
 
-function logColor(level: string): string {
+function logColor(level: string, msg?: string): string {
+  // Fatal / abort lines and engine crash output must stand out from the
+  // usual amber diagnostics so the reason a run stopped cannot be missed.
+  if (msg && (msg.startsWith("[!]") || msg.startsWith("[engine]"))) {
+    return "text-red-400 font-semibold";
+  }
   switch (level) {
     case "warn":
       return "text-amber-400";
@@ -479,7 +484,7 @@ export default function Console() {
               <div className="text-zinc-600">agent log appears here...</div>
             )}
             {logs.map((l, i) => (
-              <div key={`${l.ts}-${i}`} className={logColor(l.level)}>
+              <div key={`${l.ts}-${i}`} className={logColor(l.level, l.msg)}>
                 {l.msg}
               </div>
             ))}
