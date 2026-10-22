@@ -179,3 +179,32 @@ Stage Summary:
 - Every stage-1/2 miss now reports a concrete reason per attempt; profile and
   huge_mb auto-adapt when the signature matches a known blocker.
 - Retries default 25/attempt (cap 100).
+
+---
+Task ID: 5
+Agent: main (Z.ai)
+Task: User's real-target run showed per-attempt diag "no Set-Cookie leak at
+all" - target responds but ignores the session upload. Upgrade preflight to
+fingerprint the page on the first request.
+
+Work Log:
+- Diagnosed from the user's log (preflight 200/806B + "no Set-Cookie leak at
+  all"): the target page never starts a PHP session, so the exploit cannot
+  begin; not a retries problem.
+- engine/agent.py preflight rewritten to a raw-GET that captures headers:
+  logs Server banner, X-Powered-By (warns if PHP != 8.4.26), Apache patch
+  fingerprint vs selected profile (2.4.68 -> lab, 2.4.69 -> bookworm),
+  Location redirects, Set-Cookie names (warns on non-PHPSESSID session.name),
+  and fires "no Set-Cookie on plain GET - page never starts a PHP session;
+  point the URL at the app/login page or set session.auto_start=1" when the
+  page is session-less.
+- scripts/fake_target.py: plain/cookie modes now emit realistic Server +
+  X-Powered-By headers. test_daemon_fix.py takes mode argv; asserts preflight
+  fingerprint + no-session warning. Both branches PASS (cookie mode also
+  verified the huge_mb 12->7->24 adaptive cycle).
+- Bundle refreshed (download/php2shell-c2-console.tar.gz).
+
+Stage Summary:
+- First request now identifies: session-less page, wrong PHP version, wrong
+  Apache build profile, renamed session cookie, or redirects - before any
+  exploit attempt is wasted.
