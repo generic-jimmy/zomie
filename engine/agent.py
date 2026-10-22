@@ -190,6 +190,45 @@ class ShellAgent:
         self.log("[*] rotating worker")
         self.x.rotate()
 
+    PRIVATE_HOST_RE = re.compile(
+        r"^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)")
+
+    def preflight(self) -> None:
+        """Fail fast with an actionable message if the target is unreachable."""
+        host, port = self.t.host, self.t.port
+        try:
+            s = socket.create_connection((host, port), timeout=8.0)
+        except OSError as e:
+            hint = ""
+            if self.PRIVATE_HOST_RE.match(host):
+                hint = (" - private/VPN addresses are only routable inside their own "
+                        "network; run this console where the target is reachable "
+                        "(locally: docker compose up --build) or use a publicly "
+                        "reachable target URL")
+            raise ValueError(f"cannot reach {host}:{port} ({e}){hint}") from e
+        try:
+            s.sendall(f"GET {self.t.path} HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+            s.settimeout(10.0)
+            data = b""
+            while len(data) < 8192:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError as e:
+            raise ValueError(
+                f"TCP connect ok but HTTP request to {host}:{port} failed ({e})") from e
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+        head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
+        lines = [ln for ln in head.split("\r\n") if ln.strip()]
+        status = lines[0].strip() if lines else "no response"
+        server = next((ln for ln in lines[1:] if ln.lower().startswith("server:")), "")
+        self.log(f"[*] preflight: {status}   {server}".rstrip())
+
     def run_stage3(self, cmd: str, read_cap: int = 1 << 20) -> bytes:
         """Mirror Exploit.stage3 but return the trigger request's raw response."""
         if len(cmd.encode()) > ex.MAX_CMD:
@@ -303,6 +342,17 @@ class ShellAgent:
             return {"ok": False, "error": "not configured"}
 
         retries = int(self.cfg.get("retries", 3))
+
+        self.stage("preflight", "running")
+        try:
+            self.preflight()
+        except ValueError as e:
+            self.stage("preflight", "failed", str(e))
+            self.log(f"[-] {e}", "warn")
+            self.state_event()
+            return {"ok": False, "error": str(e)}
+        self.stage("preflight", "done")
+
         self.stage("rotate", "running")
         try:
             self.fresh_worker()
@@ -845,9 +895,13 @@ class ShellAgent:
             self.ev.emit({"type": "result", "id": rid, "ok": False,
                           "error": f"{type(e).__name__}: {e}"})
             return
-        self.ev.emit({"type": "result", "id": rid,
-                      "ok": bool(data.get("ok")) if isinstance(data, dict) else True,
-                      "data": data})
+        ok = bool(data.get("ok")) if isinstance(data, dict) else True
+        # surface the real reason: failures carry their message in data["error"]
+        err = None
+        if not ok and isinstance(data, dict):
+            err = str(data.get("error") or "failed")
+        self.ev.emit({"type": "result", "id": rid, "ok": ok,
+                      "data": data, "error": err})
 
 
 def _serve(port: int) -> None:

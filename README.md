@@ -121,10 +121,30 @@ Dockerfile           bun build + python3 runtime
 docker-compose.yml   host networking for VPN + callback
 ```
 
+## Deploying on Render (or any PaaS)
+
+The Dockerfile binds to `$PORT`, so Render's injected port (10000) is picked up
+automatically — no config needed. The python engine daemon runs inside the same
+container on 127.0.0.1 and needs no open port.
+
+**Target reachability is the #1 failure mode on PaaS.** The console exploits
+from wherever it runs — a cloud container can only reach targets that are
+routable from it:
+
+- TryHackMe VPN IPs (`10.10.x.x`) are **not** reachable from Render.
+- Render private-service IPs (`10.x.x.x`) work only if the console service is
+  in the same account/region.
+- Anything else must be publicly reachable, or run the console locally with
+  `docker compose up --build` (host networking keeps VPN routes + callback).
+
+The preflight stage fails fast with a clear message when the target is
+unreachable instead of a generic error.
+
 ## Troubleshooting
 
 | symptom | fix |
 |---------|-----|
+| `cannot reach host:port` at preflight | target not routable from the console host — see "Deploying on Render" above. |
 | `HEAP_LEAK_FAILED` | target `memory_limit` must be smaller than `--huge-mb` (default 12 MB). The page must trigger session handling with `session.upload_progress.enabled=1` and `session.use_strict_mode=0`. |
 | leaks OK, every command fails | build ≠ bookworm profile → set custom offsets, or rotate more (`retries`); confirm the endpoint is actually served by mod_php. |
 | `resp` probe finds nothing | normal on many setups; console auto-falls back to `fetch`. |
