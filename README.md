@@ -132,10 +132,13 @@ rotates the worker between attempts.
 
 The agent is also **adaptive**: after 3 consecutive stage-1 misses it switches
 to the other build profile (the two calibrated builds use different grooming
-field counts), and it cycles `huge_mb` (12 → 8 → 7 → 2 on "no cookie",
-12 → 7 → 24 on weak patterns) when the diagnostics point at body-size or
-`memory_limit` blockers. Every failed attempt logs a one-line reason so you
-can see *why* it missed.
+field counts), and it cycles `huge_mb` (12 → 7 → 24 on weak/short patterns)
+when the diagnostics point at grooming blockers. Every failed attempt logs a
+one-line reason so you can see *why* it missed.
+
+> Reverse-engineering details — the exact php-src semantics behind every rule
+> below — live in `docs/reverse-engineering.md`, with the verbatim
+> 8.4.26-vs-8.4.27 source diff in `docs/php-8.4.26-vs-8.4.27.diff`.
 
 ### Preflight is a hard GO/NO-GO gate (research-backed)
 
@@ -149,22 +152,32 @@ October 2026). Before **any** exploit attempt is spent, the agent now:
    nginx 301-redirects to `/index.php/` would otherwise bounce off the
    redirect and *never reach PHP* (the classic "no Set-Cookie at all on every
    attempt" signature).
-2. **Sends a minimal upload probe** (1KB multipart with
-   `PHP_SESSION_UPLOAD_PROGRESS`, no session cookie). PHP must answer with a
-   fresh `Set-Cookie: PHPSESSID` or the run is refused with the exact reason:
-   wrong page, `session.upload_progress.enabled=0`, `session.use_cookies=0`,
-   or a custom `session.name`. A control POST without the upload field
-   distinguishes "upload progress disabled" from "page has no session at all".
+2. **Sends a minimal upload probe shaped EXACTLY like the exploit**:
+   1KB multipart carrying a `PHPSESSID` form field (NUL value, like the PoC),
+   a `PHP_SESSION_UPLOAD_PROGRESS` field and a file part. Source-verified
+   (php-8.4.26 `ext/session/session.c`): the rfc1867 handler ignores the
+   whole request unless a session id is supplied (`MULTIPART_EVENT_FILE_START`
+   bails out otherwise) and an *empty* id makes PHP create a fresh session +
+   emit `Set-Cookie` during the parse — so a probe without the `PHPSESSID`
+   field can never see a cookie even on a perfectly vulnerable target. If the
+   shaped probe gets no Set-Cookie, the run is refused with the exact reason:
+   not PHP, `session.upload_progress.enabled=0`, `session.use_cookies=0`, a
+   renamed `session.upload_progress.name`, PHP < 5.4, or a WAF dropping the
+   PoC shape (a `PHPSESSID` form field + upload-progress field is a documented
+   WAF signature). A control POST without the upload-progress field
+   distinguishes "upload progress disabled" from "handler never engaged".
 3. **Calibrates the body size**: a 12MB probe verifies the request is not
    swallowed by `client_max_body_size` (nginx defaults to **1M** → HTTP 413)
    or `post_max_size` (PHP default 8M silently drops oversized bodies — no
-   413, just no session). If 12MB is rejected the agent retries 8 → 7 → 2MB
-   and lowers `huge_mb` to the largest size the target still accepts.
-4. **Fails fast instead of burning retries**: "no Set-Cookie at all" is a
-   routing/config problem, not grooming luck — after 4 consecutive such
-   stage-1 attempts (3 in stage 2) the run aborts with an explicit `[!]`
-   message. Retries continue only for probabilistic signatures (short/weak
-   leak cookies).
+   413, just no session). Because PHP sends the Set-Cookie *before* the big
+   field is parsed, "Set-Cookie + dropped connection" means memory_limit
+   killed the worker — which is exactly what the exploit wants, so it counts
+   as a pass. If 12MB is rejected the agent retries 8 → 7 → 2MB and lowers
+   `huge_mb` to the largest size the target still accepts.
+4. **Fails fast on dead targets, keeps going on grooming slumps**: after the
+   gate passes, "no Set-Cookie on a forge request" is a *normal* grooming
+   miss, so retries continue. Only a very long streak (12 consecutive stage-1
+   attempts / 8 in stage 2) aborts the run with an explicit `[!]` message.
 
 Retries only help when the target actually meets the exploit requirements —
 if attempts keep failing, read the diagnostic the agent logs after each
@@ -172,16 +185,18 @@ attempt:
 
 | diagnostic | meaning | fix |
 |------------|---------|-----|
-| `upload probe: no Set-Cookie PHPSESSID` (preflight fatal) | the exploit POST never reaches PHP's session handler | point the URL at the app's PHP entry page (e.g. its login page); check `session.upload_progress.enabled=1` and `session.use_cookies=1` |
-| `a plain POST gets a session cookie but the PHP_SESSION_UPLOAD_PROGRESS one does not` (preflight fatal) | upload progress disabled | enable `session.upload_progress.enabled=1` (default On) |
+| `upload probe: no Set-Cookie` (preflight fatal) | PHP's rfc1867 handler never engaged: not PHP, upload_progress/use_cookies off, renamed progress name, PHP < 5.4, or WAF | confirm the URL is served by PHP; check `session.upload_progress.enabled=1` + `session.use_cookies=1`; no retry can fix this |
+| `upload probe: HTTP 403 ... WAF ... PoC shape` (preflight fatal) | a WAF/proxy blocks multipart bodies carrying a `PHPSESSID` form field + upload-progress field (documented php2shell mitigation) | bypass/whitelist the rule for your IP, or exploit from a network path without the WAF |
+| `a POST without the PHP_SESSION_UPLOAD_PROGRESS field gets a Set-Cookie but the one with the field does not` (preflight fatal) | the target rejects exactly the upload-progress shape | same as above — treat as WAF/upload_progress interference |
 | `body probe: the server rejects NMB POSTs (HTTP 413)` (preflight fatal) | proxy/WAF body limit below the exploit's multi-MB OOM field | raise `client_max_body_size` (nginx default 1M) / lower `huge_mb` — but it must still exceed the target `memory_limit` |
-| `body probe: even a 2MB upload POST gets no Set-Cookie` (preflight fatal) | `post_max_size` under 2MB (PHP default is 8M) | fix server config; unexploitable as-is |
+| `body probe: even a 2MB upload POST never produces a Set-Cookie` (preflight fatal) | `post_max_size` under 2MB (PHP default is 8M) or a proxy silently swallowing multi-MB bodies | fix server config; unexploitable as-is |
 | `exploit POST path retargeted to ...` | a redirect was followed; POSTs now go to the final page | informational — the retargeted page must be the PHP app |
-| `no Set-Cookie leak at all` (per attempt) | request-specific: body limit or a different backend worker answered | the run auto-aborts after 4; check the preflight probe lines above |
-| `no PHPSESSID Set-Cookie leak observed` | page/session config wrong or PHP ≠ 8.4.26 mod_php prefork | enable `session.upload_progress.enabled=1`, `session.use_strict_mode=0`, `session.use_cookies=1`; confirm PHP 8.4.26 + Apache prefork |
+| `no Set-Cookie leak at all` (per attempt) | normal grooming miss on the forge request, or a different backend worker answered | retries continue; only a 12-attempt streak aborts — then raise retries and re-run |
+| `no PHPSESSID Set-Cookie leak observed` | page/session config wrong or PHP != 8.4.26 mod_php prefork | enable `session.upload_progress.enabled=1`, `session.use_strict_mode=0`, `session.use_cookies=1`; confirm PHP 8.4.26 + Apache prefork |
 | `leak cookie only NB (<1000)` | grooming did not reach the leak window | just retry / more retries; agent auto-cycles `huge_mb` |
-| `leak cookie ... best 2MB group N (need >=8)` | pattern too weak: OOM did not trigger or input caps interfere | raise `huge_mb` above the target `memory_limit` (agent cycles 12→24 automatically); target needs `max_input_vars=1000` |
-| `[manager] agent daemon exited ...` + `[engine] ...` lines | the python engine process died | the crash output is streamed into the console (no file access needed on PaaS) |
+| `leak cookie ... best 2MB group N (need >=8)` | pattern too weak: OOM did not trigger or input caps interfere | raise `huge_mb` above the target `memory_limit` (agent cycles 12->24 automatically); target needs `max_input_vars=1000` |
+| `preflight: target runs PHP x.y.z ...` | technique affects PHP 5.4+ (fixed 8.2.35/8.3.36/8.4.27/8.5.12; EOL unpatched) but the console's offsets are measured on 8.4.26 builds | derive `zif_system`/`zval_ptr_dtor` offsets on a same-build box (`nm -D libphp*.so`) and set them in the advanced drawer |
+| `anager] agent daemon exited ...` + `[engine] ...` lines | the python engine process died | the crash output is streamed into the console (no file access needed on PaaS) |
 
 Target requirements (from the PoC README): `display_errors=1`, `memory_limit`
 below `--huge-mb` (default 12M), `max_input_vars=1000`, `session.use_cookies=1`,
